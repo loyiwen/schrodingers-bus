@@ -1,0 +1,2 @@
+{"polled_at":"2026-11-06T19:00:00Z","line":"25","ok":true,"error":null,"arrivals":[{"vehicleId":"A","tripId":1,"naptanId":"S1","direction":"inbound","expectedArrival":"2026-11-06T19:05:00Z"},{"vehicleId":"B","tripId":2,"naptanId":"S1","direction":"inbound","expectedArrival":"2026-11-06T19:12:00Z"}]}
+{"polled_at":"2026-11-06T19:00:30Z","line":"25","ok":true,"error":null,"arrivals":[{"vehicleId":"A","tripId":1,"naptanId":"S1","direction":"inbound","expectedArrival":"2026-11-06T19:05:10Z"}]}
