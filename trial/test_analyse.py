@@ -55,5 +55,46 @@ class Classification(unittest.TestCase):
         self.assertEqual((r["failed_polls"], r["empty_polls"]), (1, 1))
 
 
+class FlickersAndRecordingGaps(unittest.TestCase):
+    def test_returning_prediction_is_a_flicker_not_vanished(self):
+        r = analyse_line([poll(0, OTHER, prediction("A", 900)), poll(30, OTHER), poll(60, OTHER, prediction("A", 900))])
+        self.assertEqual(r["vanished"], [])
+        self.assertEqual(r["flickers"], 1)
+
+    def test_vehicle_still_serving_other_stops_is_noted(self):
+        r = analyse_line([poll(0, prediction("A", 900), prediction("A", 1000, stop="S2")),
+                          poll(30, prediction("A", 1000, stop="S2"))])
+        self.assertTrue(r["vanished"][0]["vehicle_still_in_feed"])
+
+    def test_long_recording_gap_is_unclassified(self):
+        r = analyse_line([poll(0, OTHER, prediction("A", 9000)), poll(30, OTHER, prediction("A", 9000)),
+                          poll(60, OTHER, prediction("A", 9000)), poll(3000, OTHER)])
+        self.assertEqual(r["unclassified"], 1)
+        self.assertEqual(r["vanished"], [])
+
+
+class GapsAndConvoys(unittest.TestCase):
+    def arrivals(self, *due_times):
+        polls = []
+        for seconds in range(0, max(due_times) + 60, 30):
+            present = [prediction(f"B{i}", due) for i, due in enumerate(due_times) if seconds < due]
+            polls.append(poll(seconds, OTHER, *present))
+        return analyse_line(polls)
+
+    def test_three_close_buses_after_a_long_gap_are_one_convoy(self):
+        r = self.arrivals(60, 1860, 1920, 1980)
+        self.assertEqual(sorted(r["gaps"]), [60, 60, 1800])
+        self.assertEqual(len(r["convoys"]), 1)
+
+    def test_evenly_spaced_buses_are_not_a_convoy(self):
+        self.assertEqual(self.arrivals(60, 660, 1260)["convoys"], [])
+
+    def test_stops_are_kept_separate(self):
+        r = analyse_line([poll(0, OTHER, prediction("A", 20, stop="S1"), prediction("B", 25, stop="S2")),
+                          poll(30, OTHER)])
+        self.assertEqual(len(r["arrivals"]), 2)
+        self.assertEqual(r["gaps"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
