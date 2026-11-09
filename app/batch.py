@@ -24,21 +24,9 @@ def parse_batch(text):
         except json.JSONDecodeError as error:
             raise ValueError(f"line {number} is not valid JSON") from error
         # Only check the fields every later step relies on
-        if not isinstance(poll, dict) or "polled_at" not in poll or not isinstance(poll.get("arrivals"), list):
-            raise ValueError(f"line {number} needs polled_at and a list of arrivals")
+        if not isinstance(poll, dict) or "polled_at" not in poll or "ok" not in poll or not isinstance(poll.get("arrivals"), list):
+            raise ValueError(f"line {number} needs polled_at, ok and a list of arrivals")
         polls.append(poll)
     if not polls:
         raise ValueError("batch is empty")
     return polls
-
-
-def summarise(polls):
-    """Phase 1 placeholder for the reliability measures: prove the data got through."""
-    # TODO: replace with gaps, convoys and vanished departures in Phase 3
-    return {
-        "polls": len(polls),
-        "predictions": sum(len(poll["arrivals"]) for poll in polls),
-        # ISO 8601 UTC times sort correctly as text
-        "first_poll": min(poll["polled_at"] for poll in polls),
-        "last_poll": max(poll["polled_at"] for poll in polls),
-    }
