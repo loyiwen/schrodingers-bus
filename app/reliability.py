@@ -3,6 +3,7 @@
 
 Results are apparent vanished departures and estimated arrivals, because the feed doesn't confirm either.
 """
+import random
 import re
 import statistics
 from collections import defaultdict
@@ -12,6 +13,8 @@ EARLY_SECONDS = 120   # Leaving the feed this long before its expected time coun
 BUNCH_SECONDS = 120   # Consecutive arrivals this close count as bunched
 CONVOY_SIZE = 3       # Buses needed in a bunched run to count as a convoy
 MAX_GAP_POLLS = 3     # Longer recording gaps make a disappearance unclassifiable
+BOOTSTRAP_RESAMPLES = 2000  # More resamples give steadier intervals, but take longer
+MIN_BOOTSTRAP_GAPS = 5      # Fewer gaps than this can't give a meaningful interval
 
 
 def parse_time(text):
@@ -51,7 +54,7 @@ def analyse_line(records, early=EARLY_SECONDS, bunch=BUNCH_SECONDS, convoy_size=
     result = {
         "polls": len(polls), "failed_polls": failed, "empty_polls": empty,
         "predictions": 0, "vehicles": set(), "stops": set(), "arrivals": [],
-        "vanished": [], "flickers": 0, "unclassified": 0, "gaps": [], "convoys": [],
+        "vanished": [], "flickers": 0, "unclassified": 0, "gaps": [], "convoys": [], "gaps_by_stop": {},
     }
     if not polls:
         return result
@@ -112,13 +115,38 @@ def analyse_line(records, early=EARLY_SECONDS, bunch=BUNCH_SECONDS, convoy_size=
         for before, after in zip(arrivals, arrivals[1:]):
             gap = after - before
             result["gaps"].append(gap)
+            result["gaps_by_stop"].setdefault((stop, direction), []).append(gap)
             run = run + 1 if gap <= bunch else 1
             if run == convoy_size:  # Count each run once, when it first reaches convoy size
                 result["convoys"].append({"stop": stop, "direction": direction, "at": after})
     return result
 
 
-def report(polls):
+def bootstrap_median_interval(values, resamples, rng):
+    """Return a 95% bootstrap confidence interval for the median of values."""
+    # Resample with replacement many times, to see how much the median could vary
+    medians = [statistics.median(rng.choices(values, k=len(values))) for _ in range(resamples)]
+    return percentile(medians, 0.025), percentile(medians, 0.975)
+
+
+def stop_intervals(gaps_by_stop, resamples, seed):
+    """Return the median gap and its confidence interval for each stop with enough gaps."""
+    rng = random.Random(seed)  # Seeded, so reprocessing a batch gives identical results
+    summaries = []
+    for (stop, direction), gaps in sorted(gaps_by_stop.items()):  # Sorted, so the seed is applied in a fixed order
+        if len(gaps) < MIN_BOOTSTRAP_GAPS:
+            continue
+        minutes = [gap / 60 for gap in gaps]
+        low, high = bootstrap_median_interval(minutes, resamples, rng)
+        summaries.append({
+            "stop": stop, "direction": direction, "gaps": len(minutes),
+            "median_gap_minutes": statistics.median(minutes),
+            "interval_low_minutes": low, "interval_high_minutes": high,
+        })
+    return summaries
+
+
+def report(polls, resamples=BOOTSTRAP_RESAMPLES, seed="batch"):
     """Return a JSON-safe reliability summary for one route's batch."""
     r = analyse_line(polls)
     minutes = [gap / 60 for gap in r["gaps"]]
@@ -138,4 +166,5 @@ def report(polls):
         "apparent_vanished": len(r["vanished"]),
         "flickers": r["flickers"],
         "unclassified": r["unclassified"],
+        "stop_gaps": stop_intervals(r["gaps_by_stop"], resamples, seed),
     }
