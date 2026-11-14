@@ -113,6 +113,16 @@ def summarise(results, elapsed):
     }
 
 
+def send_run(base_url, key, run_id, paths, rate, workers, out):
+    """Send a run's batches, save its log in out, and return the send summary."""
+    out.mkdir(parents=True, exist_ok=True)
+    results, elapsed = replay(base_url.rstrip("/"), key, run_id, paths, rate, workers)
+    with (out / f"{run_id}.jsonl").open("w", encoding="utf-8") as log:
+        for result in results:
+            log.write(json.dumps(result) + "\n")
+    return summarise(results, elapsed)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("batches", type=Path, nargs="+", help="folders of batch files")
@@ -133,14 +143,9 @@ def main():
     if log_path.exists():
         parser.error(f"{log_path} already exists, so choose a new run name")
     paths = choose_batches(args.batches, args.count, args.seed)
-    args.out.mkdir(parents=True, exist_ok=True)
 
     # The key comes from the environment, so it stays out of the code and shell history
-    results, elapsed = replay(args.url.rstrip("/"), os.environ.get("FUNCTION_KEY"), args.run, paths, args.rate, args.workers)
-    summary = summarise(results, elapsed)
-    with log_path.open("w", encoding="utf-8") as log:
-        for result in results:
-            log.write(json.dumps(result) + "\n")
+    summary = send_run(args.url, os.environ.get("FUNCTION_KEY"), args.run, paths, args.rate, args.workers, args.out)
     print(json.dumps(summary, indent=2))
     print(f"Saved {log_path}")
 

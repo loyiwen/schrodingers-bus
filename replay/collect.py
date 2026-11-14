@@ -141,6 +141,40 @@ def summarise(rows):
     return summary
 
 
+def collect_run(container_url, runs, run, wait=0, offline=False):
+    """Collect a run's results until none are missing or the wait runs out, save its table and summary, and return the summary."""
+    log_path = runs / f"{run}.jsonl"
+    folder = runs / run
+    deadline = time.monotonic() + wait
+    while True:
+        if not offline:
+            download(container_url, run, folder)
+        rows = combine(log_path, folder)
+        missing = summarise(rows)["missing"]
+        # Stops once every accepted batch has a result, or when the wait runs out
+        if offline or not missing or time.monotonic() >= deadline:
+            break
+        print(f"{missing} results still missing, checking again in {CHECK_EVERY_SECONDS} s", flush=True)
+        time.sleep(CHECK_EVERY_SECONDS)
+
+    with (runs / f"{run}.csv").open("w", newline="", encoding="utf-8") as table:
+        writer = csv.DictWriter(table, fieldnames=COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    summary = summarise(rows)
+    summary["local_code_version"] = code_version(APP)
+    (runs / f"{run}-summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return summary
+
+
+def version_warning(summary):
+    """Return a warning if results came from code other than the local copy, or None."""
+    local, seen = summary["local_code_version"], summary["code_versions"]
+    if seen and seen != [local]:
+        return f"Warning: results came from {', '.join(seen)}, but local code is {local}"
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", help="the run name given to send.py")
@@ -150,7 +184,6 @@ def main():
     args = parser.parse_args()
 
     log_path = args.runs / f"{args.run}.jsonl"
-    folder = args.runs / args.run
     if not log_path.exists():
         parser.error(f"no send log at {log_path}")
     # A read-only SAS link to the results container, kept out of the code and shell history
@@ -158,33 +191,14 @@ def main():
     if not args.offline and not container_url:
         parser.error("set RESULTS_SAS_URL first")
 
-    deadline = time.monotonic() + args.wait
-    while True:
-        if not args.offline:
-            try:
-                download(container_url, args.run, folder)
-            except Exception as error:  # Only the type, as the message could include the SAS link
-                parser.error(f"download failed: {type(error).__name__}")
-        rows = combine(log_path, folder)
-        missing = summarise(rows)["missing"]
-        # Stops once every accepted batch has a result, or when the wait runs out
-        if args.offline or not missing or time.monotonic() >= deadline:
-            break
-        print(f"{missing} results still missing, checking again in {CHECK_EVERY_SECONDS} s", flush=True)
-        time.sleep(CHECK_EVERY_SECONDS)
-
-    with (args.runs / f"{args.run}.csv").open("w", newline="", encoding="utf-8") as table:
-        writer = csv.DictWriter(table, fieldnames=COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
-    summary = summarise(rows)
-    local = code_version(APP)
-    summary["local_code_version"] = local
-    (args.runs / f"{args.run}-summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    try:
+        summary = collect_run(container_url, args.runs, args.run, args.wait, args.offline)
+    except OSError as error:  # Only the type, as the message could include the SAS link
+        parser.error(f"download failed: {type(error).__name__}")
     print(json.dumps(summary, indent=2))
     print(f"Saved {args.run}.csv and {args.run}-summary.json in {args.runs}")
-    if summary["code_versions"] and summary["code_versions"] != [local]:
-        print(f"Warning: results came from {', '.join(summary['code_versions'])}, but local code is {local}")
+    if warning := version_warning(summary):
+        print(warning)
 
 
 if __name__ == "__main__":
