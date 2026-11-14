@@ -3,11 +3,14 @@ import itertools
 import json
 import logging
 import os
+import socket
 import time
 import uuid
 from datetime import datetime, timezone
+from functools import cache
 
 import azure.functions as func
+from azure.storage.blob import BlobServiceClient
 
 from batch import is_valid_batch_id, parse_batch
 from reliability import BOOTSTRAP_RESAMPLES, report
@@ -16,8 +19,11 @@ from reliability import BOOTSTRAP_RESAMPLES, report
 # TODO: decide whether experiments need a separate storage account, to keep test traffic apart
 STORAGE = "AzureWebJobsStorage"
 QUEUE = "batches-to-analyse"
-# Created once per process, so counting distinct IDs shows how many instances did the work
+BATCHES = "batches"  # Container holding the batch files
+# Created once per Python process, which can outlive a host restart, so it isn't a machine count
 INSTANCE_ID = uuid.uuid4().hex
+# The machine's name, which counts instances, and can be checked against Application Insights
+HOST_NAME = socket.gethostname()
 # Numbers each run on this instance, so 1 marks a cold start
 # next() hands each run its own number, even when runs overlap on different threads
 RUN_NUMBERS = itertools.count(1)
@@ -30,31 +36,38 @@ def utc_text(moment):
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+@cache
+def batch_container():
+    """Return a client for the batches container, created on first use and shared by every run."""
+    return BlobServiceClient.from_connection_string(os.environ[STORAGE]).get_container_client(BATCHES)
+
+
 def json_response(body, status):
     """Return an HTTP response with a JSON body."""
     return func.HttpResponse(json.dumps(body), status_code=status, mimetype="application/json")
 
 
 # Called as PUT /api/batches/{batch_id}, with the batch as the request body
-# Requires a function key, and the decorators below save the outputs after the function returns
+# Requires a function key, and the decorator below sends the queue message after the function returns
 @app.function_name("receive_batch")
 @app.route(route="batches/{batch_id}", methods=["PUT"], auth_level=func.AuthLevel.FUNCTION)
-@app.blob_output(arg_name="batch_file", path="batches/{batch_id}.jsonl", connection=STORAGE)
 @app.queue_output(arg_name="message", queue_name=QUEUE, connection=STORAGE)
-def receive_batch(req: func.HttpRequest, batch_file: func.Out[str], message: func.Out[str]) -> func.HttpResponse:
+def receive_batch(req: func.HttpRequest, message: func.Out[str]) -> func.HttpResponse:
     """Function 1: validate a batch, save it, and queue it for analysis."""
     # The ID becomes the file name, so check it before anything is saved
     batch_id = req.route_params.get("batch_id")
     if not is_valid_batch_id(batch_id):
         return json_response({"error": "invalid batch ID"}, 400)
+    body = req.get_body()
     try:
-        text = req.get_body().decode("utf-8")
-        polls = parse_batch(text)
+        polls = parse_batch(body.decode("utf-8"))
     except ValueError as error:  # UnicodeDecodeError is a ValueError too
         return json_response({"error": str(error)}, 400)
 
-    # Nothing is saved or queued unless these are set
-    batch_file.set(text)
+    # Saved here and finished before returning, rather than by an output binding
+    # The host wrote binding outputs side by side, so Function 2 often got the message first and read an empty file
+    # Overwriting keeps a repeated request harmless, and an upload error returns 500 with nothing queued
+    batch_container().upload_blob(f"{batch_id}.jsonl", body, overwrite=True)
     message.set(batch_id)  # The message is just the ID, which tells Function 2 which file to read
     # 202, as analysis happens later in Function 2
     return json_response({"batch_id": batch_id, "polls": len(polls)}, 202)
@@ -71,8 +84,9 @@ def analyse_batch(msg: func.QueueMessage, batch_file: str, result: func.Out[str]
     started = datetime.now(timezone.utc)
     clock = time.perf_counter()  # Steadier than the wall clock for measuring runtime
     batch_id = msg.get_body().decode("utf-8")
-    # Missing file: raise so the message is retried, in case it hasn't been saved yet
-    if batch_file is None:
+    # Missing or empty file: raise so the message is retried, in case it hasn't been saved yet
+    # Function 1 now saves the file before queueing, so this should only happen if something else went wrong
+    if not batch_file:
         raise ValueError(f"no batch file for {batch_id}")
 
     run_number = next(RUN_NUMBERS)
@@ -82,6 +96,7 @@ def analyse_batch(msg: func.QueueMessage, batch_file: str, result: func.Out[str]
     summary = report(parse_batch(batch_file), resamples, batch_id)
     timing = {
         "instance_id": INSTANCE_ID,
+        "host_name": HOST_NAME,
         "instance_run": run_number,
         "bootstrap_resamples": resamples,
         # Time from the message being queued to this run starting, including any retries
