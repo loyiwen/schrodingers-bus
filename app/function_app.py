@@ -1,4 +1,5 @@
 """Serverless functions for Schrödinger's Bus."""
+import itertools
 import json
 import logging
 import os
@@ -17,7 +18,9 @@ STORAGE = "AzureWebJobsStorage"
 QUEUE = "batches-to-analyse"
 # Created once per process, so counting distinct IDs shows how many instances did the work
 INSTANCE_ID = uuid.uuid4().hex
-run_count = 0  # Runs handled by this instance, so 1 marks a cold start
+# Numbers each run on this instance, so 1 marks a cold start
+# next() hands each run its own number, even when runs overlap on different threads
+RUN_NUMBERS = itertools.count(1)
 
 app = func.FunctionApp()
 
@@ -72,15 +75,14 @@ def analyse_batch(msg: func.QueueMessage, batch_file: str, result: func.Out[str]
     if batch_file is None:
         raise ValueError(f"no batch file for {batch_id}")
 
-    global run_count
-    run_count += 1
+    run_number = next(RUN_NUMBERS)
     # An app setting, so experiments can change the workload without redeploying
     resamples = int(os.environ.get("BOOTSTRAP_RESAMPLES", BOOTSTRAP_RESAMPLES))
     # Seeded with the batch ID, so reprocessing a message gives identical measures
     summary = report(parse_batch(batch_file), resamples, batch_id)
     timing = {
         "instance_id": INSTANCE_ID,
-        "instance_run": run_count,
+        "instance_run": run_number,
         "bootstrap_resamples": resamples,
         # Time from the message being queued to this run starting, including any retries
         "queue_delay_seconds": (started - msg.insertion_time).total_seconds(),
