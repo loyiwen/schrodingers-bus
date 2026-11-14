@@ -6,6 +6,7 @@ import json
 import math
 import os
 import statistics
+import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ElementTree
@@ -16,6 +17,7 @@ from pathlib import Path
 
 RUNS = Path(__file__).parent.parent / "trial" / "data" / "runs"
 ACCEPTED = 202
+CHECK_EVERY_SECONDS = 15  # How often --wait checks for new results
 # Columns of the per-batch table, in order
 COLUMNS = (
     "batch_id", "status", "bytes", "predictions", "sent_at", "send_seconds", "queued_at", "started_at",
@@ -133,23 +135,33 @@ def main():
     parser.add_argument("run", help="the run name given to send.py")
     parser.add_argument("--runs", type=Path, default=RUNS, help="folder holding the send logs")
     parser.add_argument("--offline", action="store_true", help="use results already downloaded")
+    parser.add_argument("--wait", type=int, default=0, help="seconds to keep checking until nothing is missing")
     args = parser.parse_args()
 
     log_path = args.runs / f"{args.run}.jsonl"
     folder = args.runs / args.run
     if not log_path.exists():
         parser.error(f"no send log at {log_path}")
-    if not args.offline:
-        # A read-only SAS link to the results container, kept out of the code and shell history
-        container_url = os.environ.get("RESULTS_SAS_URL")
-        if not container_url:
-            parser.error("set RESULTS_SAS_URL first")
-        try:
-            download(container_url, args.run, folder)
-        except Exception as error:  # Only the type, as the message could include the SAS link
-            parser.error(f"download failed: {type(error).__name__}")
+    # A read-only SAS link to the results container, kept out of the code and shell history
+    container_url = os.environ.get("RESULTS_SAS_URL")
+    if not args.offline and not container_url:
+        parser.error("set RESULTS_SAS_URL first")
 
-    rows = combine(log_path, folder)
+    deadline = time.monotonic() + args.wait
+    while True:
+        if not args.offline:
+            try:
+                download(container_url, args.run, folder)
+            except Exception as error:  # Only the type, as the message could include the SAS link
+                parser.error(f"download failed: {type(error).__name__}")
+        rows = combine(log_path, folder)
+        missing = summarise(rows)["missing"]
+        # Stops once every accepted batch has a result, or when the wait runs out
+        if args.offline or not missing or time.monotonic() >= deadline:
+            break
+        print(f"{missing} results still missing, checking again in {CHECK_EVERY_SECONDS} s", flush=True)
+        time.sleep(CHECK_EVERY_SECONDS)
+
     with (args.runs / f"{args.run}.csv").open("w", newline="", encoding="utf-8") as table:
         writer = csv.DictWriter(table, fieldnames=COLUMNS)
         writer.writeheader()
