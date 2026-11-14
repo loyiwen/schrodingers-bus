@@ -59,6 +59,7 @@ def run_metrics(rows, sent):
     last_sent = max(parse_time(row["sent_at"]) for row in rows)
     finished = [parse_time(row["finished_at"]) for row in done if row["finished_at"]]
     started = [parse_time(row["started_at"]) for row in done if row["started_at"]]
+    send_ends = [parse_time(row["sent_at"]).timestamp() + number(row["send_seconds"]) for row in rows]
     metrics = {
         "sent": len(rows),
         "results": len(done),
@@ -67,6 +68,8 @@ def run_metrics(rows, sent):
         "hosts": len({row["host_name"] for row in done if row["host_name"]}),
         "cold_starts": sum(row["instance_run"] == "1" for row in done),
         "send_window_seconds": (last_sent - first_sent).total_seconds(),
+        # How fast batches got in: sent and accepted, divided by the time from first send to last reply
+        "intake_rate": len(rows) / (max(send_ends) - first_sent.timestamp()),
         "max_late_seconds": max((record.get("late_seconds") or 0) for record in sent.values()),
         "end_to_end": [number(row["end_to_end_seconds"]) for row in done if row["end_to_end_seconds"]],
         "send": [number(row["send_seconds"]) for row in done],
@@ -98,7 +101,7 @@ def summarise_level(runs, rng):
         summary[f"{stage}_median"] = statistics.median(pooled[stage]) if pooled[stage] else None
     if pooled["predictions"] and pooled["runtime"]:
         summary["predictions_median"] = statistics.median(pooled["predictions"])
-    for key in ("makespan_seconds", "throughput", "processing_throughput", "hosts", "cold_starts", "max_late_seconds"):
+    for key in ("makespan_seconds", "throughput", "processing_throughput", "hosts", "cold_starts", "max_late_seconds", "intake_rate"):
         values = [run[key] for run in runs if run.get(key) is not None]
         if values:
             summary[key] = statistics.median(values)
@@ -122,12 +125,57 @@ def load_experiments(runs):
     return grouped
 
 
+def is_cold(run):
+    """A run counts as cold when most of its hosts were new, after the platform had scaled in."""
+    return run["hosts"] and run["cold_starts"] >= run["hosts"] / 2
+
+
+def write_run_table(grouped, out, rng):
+    """Write one row per run, and a Markdown comparison of cold and warm runs, pooled across experiments."""
+    columns = ("run", "experiment", "level", "cold", "hosts", "cold_starts", "makespan_seconds", "intake_rate",
+               "e2e_median", "e2e_p95", "queue_median", "runtime_median")
+    rows = []
+    for experiment, by_level in grouped.items():
+        for level, runs in sorted(by_level.items()):
+            for run in runs:
+                rows.append({"run": run["run"], "experiment": experiment, "level": level, "cold": bool(is_cold(run)),
+                             "hosts": run["hosts"], "cold_starts": run["cold_starts"],
+                             "makespan_seconds": round(run.get("makespan_seconds", 0), 2),
+                             "intake_rate": round(run["intake_rate"], 2),
+                             "e2e_median": round(statistics.median(run["end_to_end"]), 2),
+                             "e2e_p95": round(percentile(run["end_to_end"], 0.95), 2),
+                             "queue_median": round(statistics.median(run["queue"]), 2),
+                             "runtime_median": round(statistics.median(run["runtime"]), 3)})
+    with (out / "runs.csv").open("w", newline="", encoding="utf-8") as table:
+        writer = csv.DictWriter(table, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    # Bursts and lengths only: steady-rate runs warm themselves up within seconds, so their start state hardly matters
+    lines = ["## Cold against warm runs (bursts and batch lengths)", "",
+             "| Runs | Count | Batches | Queue delay median (s) | End-to-end median (s) [95% CI] | End-to-end p95 (s) [95% CI] |",
+             "|---|---:|---:|---:|---|---|"]
+    for label, cold in (("Cold", True), ("Warm", False)):
+        chosen = [run for experiment in ("burst", "length") for runs in grouped.get(experiment, {}).values()
+                  for run in runs if bool(is_cold(run)) == cold]
+        e2e = [value for run in chosen for value in run["end_to_end"]]
+        queue = [value for run in chosen for value in run["queue"]]
+        if not e2e:
+            continue
+        median_ci = bootstrap_interval(e2e, statistics.median, rng)
+        p95_ci = bootstrap_interval(e2e, lambda sample: percentile(sample, 0.95), rng)
+        lines.append(f"| {label} | {len(chosen)} | {len(e2e)} | {statistics.median(queue):.2f} | "
+                     f"{statistics.median(e2e):.2f} [{median_ci[0]:.2f} to {median_ci[1]:.2f}] | "
+                     f"{percentile(e2e, 0.95):.2f} [{p95_ci[0]:.2f} to {p95_ci[1]:.2f}] |")
+    return "\n".join(lines) + "\n"
+
+
 def write_tables(levels_by_experiment, out):
     """Write a CSV per experiment and one Markdown file with every table, for the report."""
     columns = ("level", "repeats", "batches", "missing", "retried", "hosts", "hosts_range", "cold_starts",
                "makespan_seconds", "makespan_seconds_range", "throughput", "processing_throughput",
                "e2e_median", "e2e_median_ci", "e2e_p95", "e2e_p95_ci", "send_median", "queue_median",
-               "runtime_median", "predictions_median", "max_late_seconds")
+               "runtime_median", "predictions_median", "max_late_seconds", "intake_rate")
     markdown = []
 
     def show(value):
@@ -277,8 +325,11 @@ def speedup_figure(plt, burst_runs, path):
     ax.scatter([p[0] for p in points], [p[1] for p in points], color=BLUE, s=28, zorder=3, label="Burst runs")
     top = max(p[0] for p in points) * 1.05
     ax.plot([0, top], [0, top * single], color=MUTED, linestyle="--", linewidth=1,
-            label=f"Ideal: hosts x {single:.2f} batches/s")
-    ax.set(xlabel="Hosts used", ylabel="Batches analysed per second", title="Parallel speed-up",
+            label=f"If analysis were the limit: hosts x {single:.2f} batches/s")
+    # The rate batches actually got in, from the bursts large enough to reach a steady upload
+    intake = statistics.median(run["intake_rate"] for size, runs in burst_runs.items() if size >= 250 for run in runs)
+    ax.axhline(intake, color=ORANGE, linewidth=1.6, label=f"Measured intake: {intake:.1f} batches/s")
+    ax.set(xlabel="Hosts used", ylabel="Batches analysed per second", title="Throughput against hosts: limited by intake",
            xlim=(0, None), ylim=(0, None))
     ax.legend(loc="upper left")
     fig.savefig(path)
@@ -300,6 +351,9 @@ def main():
     levels = {experiment: {level: summarise_level(runs, rng) for level, runs in by_level.items()}
               for experiment, by_level in grouped.items()}
     write_tables(levels, args.out)
+    cold_warm = write_run_table(grouped, args.out, rng)
+    with (args.out / "tables.md").open("a", encoding="utf-8") as tables:
+        tables.write("\n" + cold_warm)
 
     style(plt)
     if "burst" in levels:
@@ -309,8 +363,9 @@ def main():
                            args.out / "burst_throughput_hosts.png", log_x=True)
         stage_figure(plt, levels["burst"], "Burst size (batches)", "Where the time goes", args.out / "burst_stages.png")
         speedup_figure(plt, grouped["burst"], args.out / "speedup.png")
-        largest = max(grouped["burst"])
-        timeline_figure(plt, args.runs, grouped["burst"][largest][0]["run"], args.out / "burst_timeline.png")
+        # The repeat with the middle makespan, so one straggling request doesn't stretch the picture
+        largest = sorted(grouped["burst"][max(grouped["burst"])], key=lambda run: run["makespan_seconds"])
+        timeline_figure(plt, args.runs, largest[len(largest) // 2]["run"], args.out / "burst_timeline.png")
     if "rate" in levels:
         latency_figure(plt, levels["rate"], "Steady rate (batches per second)", "End-to-end time against steady rate",
                        args.out / "rate_latency.png", log_x=False)
