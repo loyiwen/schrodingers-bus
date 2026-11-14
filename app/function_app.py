@@ -16,8 +16,8 @@ from batch import is_valid_batch_id, parse_batch
 from reliability import BOOTSTRAP_RESAMPLES, report
 from version import code_version
 
-# App setting holding the storage connection, currently the Function App's own account
-# TODO: decide whether experiments need a separate storage account, to keep test traffic apart
+# App setting holding the storage connection: the Function App's own account, which the experiments also used
+# A separate account would keep test data apart from the platform's own use of storage
 STORAGE = "AzureWebJobsStorage"
 QUEUE = "batches-to-analyse"
 BATCHES = "batches"  # Container holding the batch files
