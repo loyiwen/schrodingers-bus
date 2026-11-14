@@ -7,7 +7,7 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
-from send import choose_batches, replay, summarise
+from send import choose_batches, reply_version, replay, summarise
 
 
 class FakeFunction(BaseHTTPRequestHandler):
@@ -80,6 +80,15 @@ class Replay(unittest.TestCase):
     def test_rate_spreads_the_requests_out(self):
         _, elapsed = replay(self.url, None, "run1", choose_batches([self.root], 3, 7), 10, 3)
         self.assertGreaterEqual(elapsed, 0.2)
+
+
+class ReplyVersion(unittest.TestCase):
+    def test_reads_the_version_from_a_reply(self):
+        self.assertEqual(reply_version(b'{"batch_id": "a", "code_version": "abc123"}'), "abc123")
+
+    def test_older_or_unreadable_replies_give_none(self):
+        for reply in (b'{"batch_id": "a"}', b"", b"not json", b"[1]"):
+            self.assertIsNone(reply_version(reply), reply)
 
 
 class Summarise(unittest.TestCase):

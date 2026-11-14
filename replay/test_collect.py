@@ -9,7 +9,7 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
-from collect import blob_url, combine, download, summarise
+from collect import blob_url, code_version, combine, download, summarise
 
 MODIFIED = "Fri, 13 Nov 2026 08:00:05 GMT"
 
@@ -46,7 +46,7 @@ class FakeContainer(BaseHTTPRequestHandler):
 
 def result(batch_id, instance, run, finished="2026-11-13T08:00:04.000Z", **extra):
     """Build a result file's contents, as Function 2 writes them."""
-    return {"batch_id": batch_id, "predictions": 100, "host_name": f"host-{instance}", "instance_id": instance, "instance_run": run,
+    return {"batch_id": batch_id, "code_version": "v2", "predictions": 100, "host_name": f"host-{instance}", "instance_id": instance, "instance_run": run,
             "queue_delay_seconds": 1.5, "runtime_seconds": 0.5, "dequeue_count": 1,
             "queued_at": "2026-11-13T08:00:01.000Z", "started_at": "2026-11-13T08:00:03.000Z",
             "finished_at": finished, **extra}
@@ -55,7 +55,7 @@ def result(batch_id, instance, run, finished="2026-11-13T08:00:04.000Z", **extra
 def sent(batch_id, status=202, at="2026-11-13T08:00:00.000Z"):
     """Build one line of a send log, as send.py writes it."""
     return json.dumps({"batch_id": batch_id, "sent_at": at, "late_seconds": 0, "status": status,
-                       "error": None, "bytes": 10, "seconds": 0.8})
+                       "error": None, "bytes": 10, "seconds": 0.8, "code_version": "v1"})
 
 
 class Download(unittest.TestCase):
@@ -131,10 +131,28 @@ class Combine(unittest.TestCase):
         self.assertIsNone(summary["median_end_to_end_seconds"])
         self.assertNotIn("makespan_seconds", summary)
 
+    def test_lists_every_code_version_seen(self):
+        summary = summarise(self.run_with([sent("a")], [result("a", "i1", 1)]))
+        self.assertEqual(summary["code_versions"], ["v1", "v2"])
+
     def test_older_results_without_host_names_give_no_host_count(self):
         old = result("a", "i1", 1)
         del old["host_name"]
         self.assertIsNone(summarise(self.run_with([sent("a")], [old]))["hosts"])
+
+
+class CodeVersion(unittest.TestCase):
+    def test_changes_with_any_deployed_file_but_not_line_endings(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app = Path(folder)
+            for name in ("function_app.py", "batch.py", "reliability.py", "version.py", "host.json", "requirements.txt"):
+                (app / name).write_bytes(b"line one\nline two\n")
+            first = code_version(app)
+            self.assertEqual(len(first), 12)
+            (app / "batch.py").write_bytes(b"line one\r\nline two\r\n")
+            self.assertEqual(code_version(app), first)
+            (app / "host.json").write_bytes(b"changed\n")
+            self.assertNotEqual(code_version(app), first)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import json
 import math
 import os
 import statistics
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -15,12 +16,17 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
+# The app's own fingerprint function, so local and deployed versions are worked out the same way
+APP = Path(__file__).parent.parent / "app"
+sys.path.insert(0, str(APP))
+from version import code_version  # noqa: E402
+
 RUNS = Path(__file__).parent.parent / "trial" / "data" / "runs"
 ACCEPTED = 202
 CHECK_EVERY_SECONDS = 15  # How often --wait checks for new results
 # Columns of the per-batch table, in order
 COLUMNS = (
-    "batch_id", "status", "bytes", "predictions", "sent_at", "send_seconds", "queued_at", "started_at",
+    "batch_id", "sent_code_version", "code_version", "status", "bytes", "predictions", "sent_at", "send_seconds", "queued_at", "started_at",
     "finished_at", "written_at", "queue_delay_seconds", "runtime_seconds", "end_to_end_seconds",
     "host_name", "instance_id", "instance_run", "dequeue_count",
 )
@@ -88,7 +94,7 @@ def combine(log_path, folder):
     for text in log_path.read_text(encoding="utf-8").splitlines():
         sent = json.loads(text)
         row = dict.fromkeys(COLUMNS)
-        row.update(batch_id=sent["batch_id"], status=sent["status"], bytes=sent["bytes"],
+        row.update(batch_id=sent["batch_id"], sent_code_version=sent.get("code_version"), status=sent["status"], bytes=sent["bytes"],
                    sent_at=sent["sent_at"], send_seconds=sent["seconds"])
         name = f"{sent['batch_id']}.json"
         if (folder / name).exists():
@@ -118,6 +124,9 @@ def summarise(rows):
         "instances": len({row["instance_id"] for row in done}),
         "cold_starts": sum(row["instance_run"] == 1 for row in done),
         "retried": sum((row["dequeue_count"] or 1) > 1 for row in done),
+        # Should be a single version, matching the local code. More than one means a deploy happened mid-run
+        # Function 1's comes from the send log, and Function 2's from the results
+        "code_versions": sorted({version for row in rows for version in (row["sent_code_version"], row["code_version"]) if version}),
     }
     for column in ("send_seconds", "queue_delay_seconds", "runtime_seconds", "end_to_end_seconds"):
         values = [row[column] for row in (timed if column == "end_to_end_seconds" else done)]
@@ -169,9 +178,13 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     summary = summarise(rows)
+    local = code_version(APP)
+    summary["local_code_version"] = local
     (args.runs / f"{args.run}-summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))
     print(f"Saved {args.run}.csv and {args.run}-summary.json in {args.runs}")
+    if summary["code_versions"] and summary["code_versions"] != [local]:
+        print(f"Warning: results came from {', '.join(summary['code_versions'])}, but local code is {local}")
 
 
 if __name__ == "__main__":

@@ -35,6 +35,14 @@ def choose_batches(folders, count, seed):
     return [paths[number % len(paths)] for number in range(count or len(paths))]
 
 
+def reply_version(reply):
+    """Return the code version from Function 1's reply, or None if it didn't give one."""
+    try:
+        return json.loads(reply).get("code_version")
+    except (ValueError, AttributeError):  # Not JSON, or JSON that isn't an object
+        return None
+
+
 def send(base_url, key, batch_id, path, due):
     """Send one batch once it's due, and return a record of what happened."""
     wait = due - time.monotonic()
@@ -46,6 +54,7 @@ def send(base_url, key, batch_id, path, due):
         "late_seconds": round(max(0, time.monotonic() - due), 4),  # Above 0 means this tool fell behind
         "status": None,
         "error": None,
+        "code_version": None,
     }
     # Read here rather than up front, as a large burst wouldn't fit in memory
     body = path.read_bytes()
@@ -58,8 +67,10 @@ def send(base_url, key, batch_id, path, due):
     clock = time.perf_counter()
     try:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-            response.read()
+            reply = response.read()
             result["status"] = response.status
+        # Function 1 reports its code version, so the log shows which deployment accepted each batch
+        result["code_version"] = reply_version(reply)
     except urllib.error.HTTPError as error:  # A refused batch is a result, so keep going
         error.close()
         result["status"] = error.code

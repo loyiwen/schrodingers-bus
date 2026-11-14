@@ -14,6 +14,7 @@ from azure.storage.blob import BlobServiceClient
 
 from batch import is_valid_batch_id, parse_batch
 from reliability import BOOTSTRAP_RESAMPLES, report
+from version import code_version
 
 # App setting holding the storage connection, currently the Function App's own account
 # TODO: decide whether experiments need a separate storage account, to keep test traffic apart
@@ -24,6 +25,8 @@ BATCHES = "batches"  # Container holding the batch files
 INSTANCE_ID = uuid.uuid4().hex
 # The machine's name, which counts instances, and can be checked against Application Insights
 HOST_NAME = socket.gethostname()
+# Worked out once at start-up, so results show which deployed code produced them
+CODE_VERSION = code_version()
 # Numbers each run on this instance, so 1 marks a cold start
 # next() hands each run its own number, even when runs overlap on different threads
 RUN_NUMBERS = itertools.count(1)
@@ -70,7 +73,7 @@ def receive_batch(req: func.HttpRequest, message: func.Out[str]) -> func.HttpRes
     batch_container().upload_blob(f"{batch_id}.jsonl", body, overwrite=True)
     message.set(batch_id)  # The message is just the ID, which tells Function 2 which file to read
     # 202, as analysis happens later in Function 2
-    return json_response({"batch_id": batch_id, "polls": len(polls)}, 202)
+    return json_response({"batch_id": batch_id, "polls": len(polls), "code_version": CODE_VERSION}, 202)
 
 
 # {queueTrigger} is the message text, so Function 2 reads and writes files named after the batch ID
@@ -95,6 +98,7 @@ def analyse_batch(msg: func.QueueMessage, batch_file: str, result: func.Out[str]
     # Seeded with the batch ID, so reprocessing a message gives identical measures
     summary = report(parse_batch(batch_file), resamples, batch_id)
     timing = {
+        "code_version": CODE_VERSION,
         "instance_id": INSTANCE_ID,
         "host_name": HOST_NAME,
         "instance_run": run_number,
