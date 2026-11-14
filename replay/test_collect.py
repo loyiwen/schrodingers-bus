@@ -46,7 +46,7 @@ class FakeContainer(BaseHTTPRequestHandler):
 
 def result(batch_id, instance, run, finished="2026-11-13T08:00:04.000Z", **extra):
     """Build a result file's contents, as Function 2 writes them."""
-    return {"batch_id": batch_id, "predictions": 100, "instance_id": instance, "instance_run": run,
+    return {"batch_id": batch_id, "predictions": 100, "host_name": f"host-{instance}", "instance_id": instance, "instance_run": run,
             "queue_delay_seconds": 1.5, "runtime_seconds": 0.5, "dequeue_count": 1,
             "queued_at": "2026-11-13T08:00:01.000Z", "started_at": "2026-11-13T08:00:03.000Z",
             "finished_at": finished, **extra}
@@ -118,7 +118,7 @@ class Combine(unittest.TestCase):
         summary = summarise(rows)
         self.assertEqual((summary["sent"], summary["accepted"], summary["results"]), (4, 3, 2))
         self.assertEqual(summary["missing"], 1)
-        self.assertEqual((summary["instances"], summary["cold_starts"], summary["retried"]), (2, 2, 1))
+        self.assertEqual((summary["hosts"], summary["instances"], summary["cold_starts"], summary["retried"]), (2, 2, 2, 1))
         self.assertEqual(summary["makespan_seconds"], 10)
         self.assertEqual(summary["p95_end_to_end_seconds"], 10)
 
@@ -130,6 +130,11 @@ class Combine(unittest.TestCase):
         self.assertEqual(summary["results"], 1)
         self.assertIsNone(summary["median_end_to_end_seconds"])
         self.assertNotIn("makespan_seconds", summary)
+
+    def test_older_results_without_host_names_give_no_host_count(self):
+        old = result("a", "i1", 1)
+        del old["host_name"]
+        self.assertIsNone(summarise(self.run_with([sent("a")], [old]))["hosts"])
 
 
 if __name__ == "__main__":

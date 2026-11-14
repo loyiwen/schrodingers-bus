@@ -22,7 +22,7 @@ CHECK_EVERY_SECONDS = 15  # How often --wait checks for new results
 COLUMNS = (
     "batch_id", "status", "bytes", "predictions", "sent_at", "send_seconds", "queued_at", "started_at",
     "finished_at", "written_at", "queue_delay_seconds", "runtime_seconds", "end_to_end_seconds",
-    "instance_id", "instance_run", "dequeue_count",
+    "host_name", "instance_id", "instance_run", "dequeue_count",
 )
 
 
@@ -113,6 +113,8 @@ def summarise(rows):
         "results": len(done),
         # Accepted but never analysed, so check the poison queue
         "missing": sum(row["status"] == ACCEPTED and row["runtime_seconds"] is None for row in rows),
+        # Machines, from results that record them, and Python processes, which can outlive a host restart
+        "hosts": len({row["host_name"] for row in done if row["host_name"]}) or None,
         "instances": len({row["instance_id"] for row in done}),
         "cold_starts": sum(row["instance_run"] == 1 for row in done),
         "retried": sum((row["dequeue_count"] or 1) > 1 for row in done),
