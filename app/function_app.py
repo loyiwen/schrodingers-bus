@@ -22,6 +22,11 @@ run_count = 0  # Runs handled by this instance, so 1 marks a cold start
 app = func.FunctionApp()
 
 
+def utc_text(moment):
+    """Return a UTC time as an ISO 8601 string, to the millisecond, so runs can be lined up."""
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
 def json_response(body, status):
     """Return an HTTP response with a JSON body."""
     return func.HttpResponse(json.dumps(body), status_code=status, mimetype="application/json")
@@ -81,6 +86,10 @@ def analyse_batch(msg: func.QueueMessage, batch_file: str, result: func.Out[str]
         "queue_delay_seconds": (started - msg.insertion_time).total_seconds(),
         "runtime_seconds": time.perf_counter() - clock,
         "dequeue_count": msg.dequeue_count,  # More than 1 means earlier attempts failed
+        # Wall-clock times, so a run's total time can be measured from the first send to the last result
+        "queued_at": utc_text(msg.insertion_time),
+        "started_at": utc_text(started),
+        "finished_at": utc_text(datetime.now(timezone.utc)),
     }
     result.set(json.dumps({"batch_id": batch_id, **summary, **timing}))
     # Also log the timing, so it can be queried in Application Insights
