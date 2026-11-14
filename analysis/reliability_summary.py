@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Combine every batch's reliability results into route-level findings, counting overlapping batches once."""
+"""Rate bus reliability for a chosen period and routes, combining batches and counting overlapping ones once."""
 import argparse
 import csv
 import json
@@ -20,7 +20,7 @@ FOLDERS = ("part1-60m", "part2-60m", "part1-w5-120m", "part2-w5-120m")
 NAME = re.compile(r"(?P<route>[A-Za-z0-9]+)-(?P<start>\d{8}T\d{6})-(?P<minutes>\d+)m")
 MAX_GAP_SECONDS = 3600  # Longer gaps are breaks in service or data, not waits a passenger would sit through
 MIN_STOP_GAPS = 30  # Stops need this many gaps for their own figures
-MIN_HOUR_GAPS = 10000  # Hours with fewer gaps are mostly the 24-hour routes, so not comparable
+QUIET_HOUR_SHARE = 0.25  # Hours with under this share of the busiest hour's gaps are mostly night routes
 BLUE, ORANGE, INK, MUTED = "#2a78d6", "#eb6834", "#0b0b0b", "#52514e"
 
 
@@ -66,17 +66,34 @@ def excess_wait(gaps):
     return average, average - total / len(gaps) / 2
 
 
-def summarise(batches):
-    """Keep each event only in the batch that owns its moment, then work out gaps and measures per route."""
+def parse_moment(text):
+    """Turn a UTC time such as 2026-11-09T06:00 into seconds since the epoch."""
+    return datetime.strptime(text, "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc).timestamp()
+
+
+def batch_window(path):
+    """Return a batch file's route, and its window's start and end in seconds, from its name."""
+    match = NAME.fullmatch(path.stem)
+    start = datetime.strptime(match["start"], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc).timestamp()
+    return match["route"], start, start + int(match["minutes"]) * 60
+
+
+def summarise(batches, period=(float("-inf"), float("inf"))):
+    """Keep each event only in the batch that owns its moment, within the period, then work out measures per route."""
     by_route_part = defaultdict(list)
     for batch in batches:
         by_route_part[(batch["route"], batch["folder"])].append(batch)
     arrivals, convoy_detections, vanished = defaultdict(list), defaultdict(list), defaultdict(list)
-    naive = Counter()
+    naive, covered = Counter(), Counter()  # Arrivals before removing overlaps, and seconds analysed per route
     names = {}
     for (route, folder), group in by_route_part.items():
         group.sort(key=lambda batch: batch["start"])
         for batch, (low, high) in zip(group, owned_ranges([b["start"] for b in group], group[0]["length"])):
+            # Neighbours are still needed to decide ownership, but only the part inside the period counts
+            low, high = max(low, period[0]), min(high, period[1])
+            if low >= high:
+                continue
+            covered[route] += high - low
             names.update(batch["names"])
             naive[route] += len(batch["arrivals"])
             arrivals[(route, folder)] += [a for a in batch["arrivals"] if low <= a[2] < high]
@@ -119,17 +136,21 @@ def summarise(batches):
     rows = []
     for route, record in sorted(routes.items()):
         gaps = record["gaps"]
+        if len(gaps) < 2:  # Too little service in the period to rate this route
+            continue
         average, excess = excess_wait(gaps)
         per_day = [excess_wait(day)[1] / 60 for day in record["days"].values() if len(day) >= 100]
         events = Counter(event["kind"] for event in vanished[route])
         convoys = record["convoys"]
         rows.append({
-            "route": route, "arrivals": record["arrivals"], "naive_arrivals": record["naive_arrivals"],
+            "route": route, "hours": covered[route] / 3600, "arrivals": record["arrivals"],
+            "naive_arrivals": record["naive_arrivals"],
             "gaps": len(gaps), "median_gap_minutes": statistics.median(gaps) / 60,
             "p95_gap_minutes": sorted(gaps)[int(0.95 * (len(gaps) - 1))] / 60,
             "average_wait_minutes": average / 60, "excess_wait_minutes": excess / 60,
             "excess_wait_daily_range": (min(per_day), max(per_day)) if per_day else None,
-            "convoys": len(convoys), "convoy_detections": record["detections"],  # Stop by stop, before grouping
+            "convoys": len(convoys), "convoys_per_day": len(convoys) / covered[route] * 86400,
+            "convoy_detections": record["detections"],  # Stop by stop, before grouping
             "median_convoy_stops": statistics.median(c["stops"] for c in convoys) if convoys else 0,
             "vanished_vehicles": events["vanished"], "vanished_returned": events["returned"],
             "vanished_unconfirmed": events["unconfirmed"],
@@ -139,7 +160,7 @@ def summarise(batches):
     return rows, stops, hour_rows
 
 
-def write_outputs(rows, stops, hour_rows, out):
+def write_outputs(rows, stops, hour_rows, out, heading):
     """Write the route and stop tables, a Markdown summary and two figures."""
     def number(value):
         if isinstance(value, tuple):
@@ -152,10 +173,10 @@ def write_outputs(rows, stops, hour_rows, out):
             writer.writeheader()
             writer.writerows({key: number(value) for key, value in row.items()} for row in table)
 
-    columns = ("route", "arrivals", "median_gap_minutes", "p95_gap_minutes", "average_wait_minutes",
-               "excess_wait_minutes", "excess_wait_daily_range", "convoys", "median_convoy_stops",
+    columns = ("route", "hours", "arrivals", "median_gap_minutes", "p95_gap_minutes", "average_wait_minutes",
+               "excess_wait_minutes", "excess_wait_daily_range", "convoys", "convoys_per_day", "median_convoy_stops",
                "vanished_vehicles", "vanished_returned", "vanished_unconfirmed")
-    lines = ["## Routes", "", "| " + " | ".join(columns) + " |", "|" + "---|" * len(columns)]
+    lines = [heading, "", "## Routes", "", "| " + " | ".join(columns) + " |", "|" + "---|" * len(columns)]
     lines += ["| " + " | ".join(number(row[c]) for c in columns) + " |" for row in rows]
     worst = sorted(stops, key=lambda s: s["excess_wait_minutes"], reverse=True)[:10]
     lines += ["", f"## Stops with the most excess wait (at least {MIN_STOP_GAPS} gaps)", "",
@@ -180,8 +201,8 @@ def write_outputs(rows, stops, hour_rows, out):
     labels = [row["route"] for row in ordered]
     left.barh(labels, [row["excess_wait_minutes"] for row in ordered], color=BLUE, height=0.6)
     left.set(xlabel="Minutes", title="Excess wait from uneven gaps")
-    right.barh(labels, [row["convoys"] / 80 * 24 for row in ordered], color=ORANGE, height=0.6)
-    right.set(xlabel="Per 24 hours recorded", title="Convoys of 3+ buses")
+    right.barh(labels, [row["convoys_per_day"] for row in ordered], color=ORANGE, height=0.6)
+    right.set(xlabel="Per 24 hours analysed", title="Convoys of 3+ buses")
     for ax in (left, right):
         ax.grid(axis="y", visible=False)
     left.set_ylabel("Route")
@@ -191,13 +212,14 @@ def write_outputs(rows, stops, hour_rows, out):
 
     fig, ax = plt.subplots(figsize=(6.4, 3.0))
     # Night hours have few buses, mostly the two 24-hour routes, so they're shown hollow rather than as comparable
-    quiet = [row for row in hour_rows if row["gaps"] < MIN_HOUR_GAPS]
+    threshold = QUIET_HOUR_SHARE * max(row["gaps"] for row in hour_rows)
+    quiet = [row for row in hour_rows if row["gaps"] < threshold]
     # NaN at quiet hours breaks the line there, rather than joining across the night
     ax.plot([row["hour"] for row in hour_rows],
-            [row["excess_wait_minutes"] if row["gaps"] >= MIN_HOUR_GAPS else float("nan") for row in hour_rows],
+            [row["excess_wait_minutes"] if row["gaps"] >= threshold else float("nan") for row in hour_rows],
             color=BLUE, marker="o", label="All routes running")
     ax.scatter([row["hour"] for row in quiet], [row["excess_wait_minutes"] for row in quiet], facecolors="none",
-               edgecolors=MUTED, label=f"Night: under {MIN_HOUR_GAPS:,} gaps, few routes")
+               edgecolors=MUTED, label="Quiet hours, mostly night routes")
     ax.set(xlabel="Hour of day (UK time)", ylabel="Excess wait (min)",
            title="Excess wait from uneven gaps, by hour", xticks=range(0, 24, 3), ylim=(0, None))
     ax.legend(loc="upper right")
@@ -210,15 +232,32 @@ def main():
     parser.add_argument("--batches", type=Path, default=DATA / "batches")
     parser.add_argument("--out", type=Path, default=DATA / "analysis")
     parser.add_argument("--workers", type=int, default=None, help="processes to use, by default one per core")
+    parser.add_argument("--from", dest="start", help="start of the period, in UTC, such as 2026-11-09T06:00")
+    parser.add_argument("--to", dest="end", help="end of the period, in UTC, such as 2026-11-10T06:00")
+    parser.add_argument("--routes", help="comma-separated routes, such as 18,25, or every route if left out")
     args = parser.parse_args()
-    paths = sorted(path for folder in FOLDERS for path in (args.batches / folder).glob("*.jsonl"))
+    period = (parse_moment(args.start) if args.start else float("-inf"), parse_moment(args.end) if args.end else float("inf"))
+    if period[0] >= period[1]:
+        parser.error("--from must be before --to")
+    routes = set(args.routes.split(",")) if args.routes else None
+
+    # Only batches for the chosen routes whose windows overlap the period, plus their neighbours for ownership
+    paths = []
+    for path in sorted(path for folder in FOLDERS for path in (args.batches / folder).glob("*.jsonl")):
+        route, start, end = batch_window(path)
+        if (not routes or route in routes) and end + 3600 > period[0] and start - 3600 < period[1]:
+            paths.append(path)
     if not paths:
-        parser.error(f"no batches found in {args.batches}")
+        parser.error("no batches match those routes and that period")
     with Pool(args.workers) as pool:
         batches = pool.map(analyse_batch_file, paths, chunksize=4)
     args.out.mkdir(parents=True, exist_ok=True)
-    rows, stops, hour_rows = summarise(batches)
-    write_outputs(rows, stops, hour_rows, args.out)
+    rows, stops, hour_rows = summarise(batches, period)
+    if not rows:
+        parser.error("no route had enough service in that period to rate")
+    heading = (f"# Reliability from {args.start or 'the start of the data'} to {args.end or 'the end of the data'} UTC, "
+               f"{'routes ' + args.routes if args.routes else 'all routes'}")
+    write_outputs(rows, stops, hour_rows, args.out, heading)
     print(f"Analysed {len(paths)} batches. Wrote reliability.md, CSVs and figures to {args.out}")
 
 

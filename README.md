@@ -2,7 +2,7 @@
 
 Until it arrives, a London bus is both coming and not coming.
 
-Schrödinger's Bus is a serverless workflow on Azure Functions that measures how reliable London buses are from a passenger's point of view. It uses live arrival predictions from Transport for London (TfL), and for each route and stop it reports:
+Schrödinger's Bus is a serverless workflow on Azure Functions that rates how reliable London buses were over a chosen period, from a passenger's point of view. It uses recorded arrival predictions from Transport for London (TfL), and for each route and stop it reports:
 
 - **Gaps:** how long passengers wait between buses, with bootstrap confidence intervals.
 - **Convoys:** buses arriving bunched together, three or more at a time.
@@ -119,7 +119,7 @@ pip install -r analysis/requirements.txt
 python3 analysis/analyse_runs.py
 ```
 
-The other scripts measure feed delay from the recordings, combine every batch into route-level reliability findings (counting overlapping batches once), and draw the architecture diagram:
+The other scripts measure feed delay from the recordings, rate reliability by combining batches into route- and stop-level findings (counting overlapping batches once), and draw the architecture diagram:
 
 ```bash
 python3 analysis/feed_delay.py
@@ -127,6 +127,12 @@ python3 analysis/feed_delay.py
 
 ```bash
 python3 analysis/reliability_summary.py
+```
+
+To rate a particular period or set of routes, give the period in UTC. This writes the report to its own folder:
+
+```bash
+python3 analysis/reliability_summary.py --routes 18,25 --from 2026-11-11T00:00 --to 2026-11-12T00:00 --out trial/data/analysis/day-18-25
 ```
 
 ```bash
